@@ -11,7 +11,7 @@
 	"scripts": {
 		"cf-typegen": "wrangler types",
 		"check": "tsc --noEmit && wrangler deploy --dry-run",
-		"deploy": "wrangler deploy",
+		"deploy:auth": "bash deploy.sh",
 		"dev": "wrangler dev --port 8787",
 		"start": "wrangler dev",
 		"test": "vitest",
@@ -22,8 +22,9 @@
 		"@cloudflare/vitest-pool-workers": "^0.7.0",
 		"@cloudflare/workers-types": "^4.20250425.0",
 		"@types/node": "^24.0.0",
+		"p-limit": "^6.2.0",
 		"typescript": "^5.9.3",
-		"vitest": "^3.2.0",
+		"vitest": "^2.1.8",
 		"wrangler": "^4.56.0"
 	},
 	"keywords": ["ai", "chat", "workers", "d1", "production"],

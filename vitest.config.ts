@@ -8,19 +8,6 @@ export default defineWorkersConfig({
 			},
 		},
 		globals: true,
-		reporter: ['verbose', 'json'],
-		outputFile: {
-			json: 'coverage/report.json',
-		},
-		coverage: {
-			provider: 'v8',
-			reporter: ['text', 'lcov', 'json'],
-			exclude: [
-				'**/*.d.ts',
-				'**/node_modules/**',
-				'test/**',
-				'src/validation.ts',
-			],
-		},
+		reporter: ['verbose'],
 	},
 });
