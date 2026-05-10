@@ -1,147 +1,431 @@
 /**
- * LLM Chat Application Template with Multi-Contact Support
- *
- * A chat application using Cloudflare Workers AI with D1 database persistence
- * and personalized personas for each contact.
+ * AI Chat Application - Production Version
+ * 
+ * Features:
+ * - JWT Authentication
+ * - Rate Limiting  
+ * - Input Validation (Zod)
+ * - Structured Logging
+ * - D1 Database Persistence
+ * - Streaming AI Responses
  */
+
 import { Env, ChatMessage, Contact, ConversationRecord } from "./types";
+import { config } from "./config";
+import { validate, loginUserSchema, createContactSchema, chatMessageSchema, historyQuerySchema } from "./validation";
+import { generateJWT, decodeJWT, extractSessionId, getRateLimitKey } from "./auth";
+import { hashPassword, verifyPassword } from "./password";
+import logger from "./logger";
 
-// Model ID for Workers AI model
-const MODEL_ID = "@cf/meta/llama-3.1-8b-instruct-fp8";
+// Model configuration
+const MODEL_ID = config.workersAI.model;
 
-// Default system prompt (fallback)
-const DEFAULT_SYSTEM_PROMPT = "You are a helpful, friendly assistant.";
+// Session storage (In production, use Redis/Durable Objects)
+interface Session {
+	userId: number;
+	username: string;
+	createdAt: number;
+}
 
-// Session storage (in production, use Redis or similar)
-const sessions = new Map<string, { userId: string; expiresAt: number }>();
+const sessions = new Map<string, Session>();
+
+// ==================== Middleware Helpers ====================
+
+async function checkAuth(env: Env, headers: Headers): Promise<{ valid: boolean; sessionId?: string; payload?: any }> {
+	const sessionId = extractSessionId(headers);
+	
+	if (!sessionId) {
+		logger.debug("No session ID provided", undefined, "auth");
+		return { valid: false };
+	}
+
+	if (!sessions.has(sessionId)) {
+		logger.warn("Invalid session ID", { sessionId }, "auth");
+		return { valid: false };
+	}
+
+	const session = sessions.get(sessionId)!;
+
+	// Check expiration
+	if (Date.now() > session.createdAt + config.security.sessionExpiryHours * 60 * 60 * 1000) {
+		sessions.delete(sessionId);
+		logger.warn("Session expired", { sessionId }, "auth");
+		return { valid: false };
+	}
+
+	return { valid: true, sessionId, payload: session };
+}
+
+async function checkRateLimit(caches: CacheStorage, key: string): Promise<boolean> {
+	try {
+		const cache = await caches.open("rate-limit");
+		const response = await cache.match(key);
+		
+		if (response && response.ok) {
+			const data = await response.json();
+			if (data.count >= config.rateLimit.maxRequests) {
+				logger.warn("Rate limit exceeded", { key, count: data.count }, "ratelimit");
+				return false;
+			}
+			
+			// Increment counter
+			data.count += 1;
+			data.lastRequest = Date.now();
+			await cache.put(key, new Response(JSON.stringify(data), {
+				headers: { "Cache-Control": `max-age=${config.rateLimit.windowMs / 1000}` }
+			}));
+			return true;
+		}
+
+		// Initialize counter
+		const initialData = { count: 1, lastRequest: Date.now() };
+		await cache.put(key, new Response(JSON.stringify(initialData), {
+			headers: { "Cache-Control": `max-age=${config.rateLimit.windowMs / 1000}` }
+		}));
+		return true;
+	} catch (error) {
+		logger.error(`Rate limiting failed: ${error}`, { key }, "ratelimit");
+		return true; // Fail open
+	}
+}
+
+// ==================== API Handlers ====================
 
 export default {
 	async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
 		const url = new URL(request.url);
 
-		// Handle static assets (frontend)
+		// Handle static assets
 		if (url.pathname === "/" || !url.pathname.startsWith("/api/")) {
 			return env.ASSETS.fetch(request);
 		}
 
-		// API Routes
-		switch (url.pathname) {
-			case "/api/chat":
-				if (request.method === "POST") {
-					return handleChatRequest(request, env, ctx);
-				}
-				return new Response("Method not allowed", { status: 405 });
+		// Route handling
+		try {
+			switch (url.pathname) {
+				case "/api/chat":
+					return request.method === "POST" 
+						? handleChatRequest(request, env, ctx)
+						: jsonError({ error: "Method not allowed", code: "METHOD_NOT_ALLOWED" }, 405);
 
-			case "/api/contacts":
-				switch (request.method) {
-					case "GET":
-						return handleGetContacts(env);
-					case "POST":
-						return handleCreateContact(request, env);
-					default:
-						return new Response("Method not allowed", { status: 405 });
-				}
+				case "/api/contacts":
+					return request.method === "GET"
+						? handleGetContacts(env)
+						: request.method === "POST"
+							? handleCreateContact(request, env, ctx)
+							: jsonError({ error: "Method not allowed", code: "METHOD_NOT_ALLOWED" }, 405);
 
-			case "/api/history":
-				if (request.method === "GET") {
-					return handleGetHistory(request, env);
-				}
-				return new Response("Method not allowed", { status: 405 });
+				case "/api/history":
+					return request.method === "GET"
+						? handleGetHistory(request, env)
+						: jsonError({ error: "Method not allowed", code: "METHOD_NOT_ALLOWED" }, 405);
 
-			case "/api/login":
-				if (request.method === "POST") {
-					return handleLogin(request, env);
-				}
-				return new Response("Method not allowed", { status: 405 });
+				case "/api/login":
+					return request.method === "POST"
+						? handleLogin(request, env, ctx)
+						: jsonError({ error: "Method not allowed", code: "METHOD_NOT_ALLOWED" }, 405);
 
-			case "/api/auth/check":
-				return handleAuthCheck(request);
+				case "/api/auth/check":
+					return handleAuthCheck(request);
 
-			default:
-				return new Response("Not found", { status: 404 });
+				default:
+					return jsonError({ error: "Not found", code: "NOT_FOUND" }, 404);
+			}
+		} catch (error) {
+			logger.error("Unhandled error", { error: String(error) }, "api");
+			return jsonError({ error: "Internal server error", code: "INTERNAL_ERROR" }, 500);
 		}
 	},
 } satisfies ExportedHandler<Env>;
 
-/**
- * Handles chat API requests with persona-based prompts
- */
-async function handleChatRequest(
-	request: Request,
-	env: Env,
-	ctx: ExecutionContext,
-): Promise<Response> {
-	try {
-		const { messages = [], contactId }: { messages: ChatMessage[]; contactId: number } = await request.json();
+// ==================== Error Helper ====================
 
-		// Fetch contact persona from database
+function jsonError(error: { error: string; code?: string; message?: string }, status: number): Response {
+	return new Response(JSON.stringify(error), {
+		status,
+		headers: { "Content-Type": "application/json" },
+	});
+}
+
+// ==================== Chat Handler ====================
+
+async function handleChatRequest(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+	try {
+		// Rate limit
+		const ip = request.headers.get("X-Forwarded-For") || "unknown";
+		const rateKey = getRateLimitKey(ip);
+		const caches = await caches.open("main");
+		if (!(await checkRateLimit(caches, `${rateKey}:chat`))) {
+			return jsonError({ error: "Rate limit exceeded", code: "RATE_LIMIT_EXCEEDED" }, 429);
+		}
+
+		// Auth check
+		const auth = await checkAuth(env, request.headers);
+		if (!auth.valid) {
+			return jsonError({ error: "Authentication required", code: "UNAUTHORIZED" }, 401);
+		}
+
+		// Parse and validate
+		const body = await request.json();
+		const validation = validate(chatMessageSchema, {
+			...body,
+			sessionId: auth.sessionId
+		});
+
+		if (!validation.valid) {
+			return jsonError({ 
+				error: "Validation failed", 
+				code: "VALIDATION_ERROR",
+				message: validation.errors?.join(", ")
+			}, 400);
+		}
+
+		const { messages, contactId } = validation.data;
+
+		// Fetch persona
 		const contactResult = await env.DB.prepare(
 			"SELECT persona FROM contacts WHERE id = ?"
 		).bind(contactId).first<{ persona: string }>();
 
 		if (!contactResult) {
-			return new Response(JSON.stringify({ error: "Contact not found" }), {
-				status: 404,
-				headers: { "content-type": "application/json" },
-			});
+			return jsonError({ error: "Contact not found", code: "CONTACT_NOT_FOUND" }, 404);
 		}
 
-		const personaPrompt = contactResult.persona || DEFAULT_SYSTEM_PROMPT;
+		// Build prompt
+		const systemPrompt = `${contactResult.persona}\n\n当前对话正在进行中，请根据前面的对话内容继续回复。`;
+		let formattedMessages = [
+			{ role: "system", content: systemPrompt },
+			...messages.filter(m => m.role !== "system").slice(-20)
+		];
 
-		// Build the system prompt by combining persona with context
-		const systemPrompt = `${personaPrompt}\n\n当前对话正在进行中，请根据前面的对话内容继续回复。`;
+		// Generate response
+		const stream = await env.AI.run(MODEL_ID, {
+			messages: formattedMessages,
+			max_tokens: 512,
+			stream: true,
+		});
 
-		// Add system prompt if not present
-		let formattedMessages = [...messages];
-		if (!formattedMessages.some((msg) => msg.role === "system")) {
-			formattedMessages.unshift({ role: "system", content: systemPrompt });
-		}
-
-		// Limit to last 20 messages to avoid token limits
-		if (formattedMessages.length > 20) {
-			formattedMessages = formattedMessages.slice(-20);
-		}
-
-		const stream = await env.AI.run(
-			MODEL_ID,
-			{
-				messages: formattedMessages,
-				max_tokens: 512,
-				stream: true,
-			}
-		);
-
-		// Save user message to database asynchronously
-		const body = await request.json();
-		ctx.waitUntil(saveToDatabase(env, contactId, body.messages[body.messages.length - 1].content, ""));
+		// Save user message
+		ctx.waitUntil(saveConversation(env, contactId, messages[messages.length - 1].content, ""));
 
 		return new Response(stream, {
 			headers: {
-				"content-type": "text/event-stream; charset=utf-8",
-				"cache-control": "no-cache",
-				connection: "keep-alive",
+				"Content-Type": "text/event-stream; charset=utf-8",
+				"Cache-Control": "no-cache",
+				Connection: "keep-alive",
 			},
 		});
 	} catch (error) {
-		console.error("Error processing chat request:", error);
-		return new Response(
-			JSON.stringify({ error: "Failed to process request" }),
-			{ status: 500, headers: { "content-type": "application/json" } }
-		);
+		logger.error("Chat request failed", { error: String(error) }, "chat");
+		return jsonError({ error: "Failed to process request", code: "CHAT_ERROR" }, 500);
 	}
 }
 
-/**
- * Saves conversation to database
- */
-async function saveToDatabase(
-	env: Env,
-	contactId: number,
-	userMessage: string,
-	aiReply: string
-): Promise<void> {
+// ==================== Contacts Handlers ====================
+
+async function handleGetContacts(env: Env): Promise<Response> {
 	try {
-		const record: ConversationRecord = {
+		const results = await env.DB.prepare(
+			"SELECT id, name, initials, avatar_color, last_message, timestamp FROM contacts ORDER BY updated_at DESC"
+		).all<Contact[]>();
+
+		return jsonSuccess(results.results);
+	} catch (error) {
+		logger.error("Failed to fetch contacts", { error: String(error) }, "contacts");
+		return jsonError({ error: "Failed to fetch contacts", code: "DB_ERROR" }, 500);
+	}
+}
+
+async function handleCreateContact(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+	try {
+		// Rate limit
+		const ip = request.headers.get("X-Forwarded-For") || "unknown";
+		const caches = await caches.open("main");
+		if (!(await checkRateLimit(caches, `${getRateLimitKey(ip)}:create_contact`))) {
+			return jsonError({ error: "Rate limit exceeded", code: "RATE_LIMIT_EXCEEDED" }, 429);
+		}
+
+		// Auth check
+		const auth = await checkAuth(env, request.headers);
+		if (!auth.valid) {
+			return jsonError({ error: "Authentication required", code: "UNAUTHORIZED" }, 401);
+		}
+
+		// Parse and validate
+		const body = await request.json();
+		const validation = validate(createContactSchema, { ...body, sessionId: auth.sessionId });
+
+		if (!validation.valid) {
+			return jsonError({ 
+				error: "Validation failed", 
+				code: "VALIDATION_ERROR",
+				message: validation.errors?.join(", ")
+			}, 400);
+		}
+
+		const { name, initials, persona, avatarColor } = validation.data;
+
+		// Insert
+		const result = await env.DB.prepare(`
+			INSERT INTO contacts (name, initials, persona, avatar_color, status)
+			VALUES (?, ?, ?, ?, 'online')
+		`).bind(name, initials, persona, avatarColor).run();
+
+		logger.info("Contact created", { name, userId: auth.payload?.userId }, "contacts");
+
+		return jsonSuccess({
+			success: true,
+			id: Number(result.meta.last_row_id),
+			name,
+			initials,
+			avatarColor
+		});
+	} catch (error) {
+		logger.error("Failed to create contact", { error: String(error) }, "contacts");
+		return jsonError({ error: "Failed to create contact", code: "DB_ERROR" }, 500);
+	}
+}
+
+// ==================== History Handler ====================
+
+async function handleGetHistory(request: Request, env: Env): Promise<Response> {
+	try {
+		const url = new URL(request.url);
+		const queryValidation = validate(historyQuerySchema, {
+			contactId: parseInt(url.searchParams.get("contactId") || "0"),
+			limit: parseInt(url.searchParams.get("limit") || "50"),
+		});
+
+		if (!queryValidation.valid) {
+			return jsonError({ 
+				error: "Invalid query parameters", 
+				code: "VALIDATION_ERROR",
+				message: queryValidation.errors?.join(", ")
+			}, 400);
+		}
+
+		const { contactId, limit } = queryValidation.data;
+
+		const results = await env.DB.prepare(`
+			SELECT user_message, ai_reply, timestamp 
+			FROM conversations 
+			WHERE contact_id = ? 
+			ORDER BY timestamp ASC 
+			LIMIT ?
+		`).bind(contactId, limit).all<ConversationRecord[]>();
+
+		return jsonSuccess(results.results);
+	} catch (error) {
+		logger.error("Failed to fetch history", { error: String(error) }, "history");
+		return jsonError({ error: "Failed to fetch history", code: "DB_ERROR" }, 500);
+	}
+}
+
+// ==================== Login Handler ====================
+
+async function handleLogin(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+	try {
+		// Rate limit
+		const ip = request.headers.get("X-Forwarded-For") || "unknown";
+		const caches = await caches.open("main");
+		if (!(await checkRateLimit(caches, `${getRateLimitKey(ip)}:login`))) {
+			return jsonError({ error: "Rate limit exceeded", code: "RATE_LIMIT_EXCEEDED" }, 429);
+		}
+
+		// Parse and validate
+		const body = await request.json();
+		const validation = validate(loginUserSchema, body);
+
+		if (!validation.valid) {
+			return jsonError({ 
+				error: "Invalid credentials", 
+				code: "VALIDATION_ERROR",
+				message: validation.errors?.join(", ")
+			}, 400);
+		}
+
+		const { username, password } = validation.data;
+
+		// Hash password
+		const hashedPassword = await hashPassword(password);
+
+		// Check user
+		const userResult = await env.DB.prepare(`
+			SELECT id, username, password_hash FROM users WHERE username = ?
+		`).bind(username).first();
+
+		if (!userResult) {
+			logger.warn("Login attempt with invalid username", { username }, "auth");
+			return jsonError({ error: "Invalid credentials", code: "INVALID_CREDENTIALS" }, 401);
+		}
+
+		if (userResult.password_hash !== hashedPassword) {
+			logger.warn("Login attempt with incorrect password", { username }, "auth");
+			return jsonError({ error: "Invalid credentials", code: "INVALID_CREDENTIALS" }, 401);
+		}
+
+		// Generate token
+		const jwtToken = generateJWT({
+			userId: userResult.id,
+			username: userResult.username
+		});
+
+		logger.info("User logged in", { userId: userResult.id, username: userResult.username }, "auth");
+
+		return new Response(JSON.stringify({
+			success: true,
+			token: jwtToken,
+			user: { id: userResult.id, username: userResult.username }
+		}), {
+			headers: { 
+				"Content-Type": "application/json",
+				"Set-Cookie": `jwt=${jwtToken}; Path=/; HttpOnly; SameSite=Strict`
+			}
+		});
+	} catch (error) {
+		logger.error("Login failed", { error: String(error) }, "auth");
+		return jsonError({ error: "Login failed", code: "LOGIN_ERROR" }, 500);
+	}
+}
+
+// ==================== Auth Check Handler ====================
+
+function handleAuthCheck(request: Request): Response {
+	const cookies = request.headers.get("Cookie");
+	const cookieMatch = cookies?.match(/jwt=([^;]+)/);
+	const paramToken = new URL(request.url).searchParams.get("token");
+	const hasToken = cookieMatch || paramToken;
+
+	if (!hasToken) {
+		return jsonSuccess({ authenticated: false });
+	}
+
+	// Simple JWT verification (in production, use proper library)
+	try {
+		const token = cookieMatch?.[1] || paramToken!;
+		const decoded = decodeJWT(token);
+		
+		if (!decoded || !decoded.exp || decoded.exp < Math.floor(Date.now() / 1000)) {
+			return jsonSuccess({ authenticated: false });
+		}
+
+		return jsonSuccess({ authenticated: true, user: decoded });
+	} catch {
+		return jsonSuccess({ authenticated: false });
+	}
+}
+
+// ==================== Helper Functions ====================
+
+function jsonSuccess<T>(data: T): Response {
+	return new Response(JSON.stringify({ success: true, data }), {
+		headers: { "Content-Type": "application/json" },
+	});
+}
+
+async function saveConversation(env: Env, contactId: number, userMessage: string, aiReply: string): Promise<void> {
+	try {
+		const record = {
 			id: crypto.randomUUID(),
 			contact_id: contactId,
 			user_message: userMessage,
@@ -154,215 +438,10 @@ async function saveToDatabase(
 			VALUES (?, ?, ?, ?, ?)
 		`).bind(record.id, record.contact_id, record.user_message, record.ai_reply, record.timestamp).run();
 
-		// Update last message in contacts table
 		await env.DB.prepare(`
 			UPDATE contacts SET last_message = ?, timestamp = ? WHERE id = ?
 		`).bind(userMessage, Date.now(), contactId).run();
 	} catch (error) {
-		console.error("Error saving to database:", error);
+		logger.error("Failed to save conversation", { error: String(error) }, "database");
 	}
-}
-
-/**
- * Handles GET /api/contacts
- */
-async function handleGetContacts(env: Env): Promise<Response> {
-	try {
-		const results = await env.DB.prepare(
-			"SELECT id, name, initials, status, avatar_color, last_message, timestamp FROM contacts ORDER BY updated_at DESC"
-		).all<Contact[]>();
-
-		return new Response(JSON.stringify(results.results), {
-			headers: { "content-type": "application/json" },
-		});
-	} catch (error) {
-		console.error("Error fetching contacts:", error);
-		return new Response(
-			JSON.stringify({ error: "Failed to fetch contacts" }),
-			{ status: 500, headers: { "content-type": "application/json" } }
-		);
-	}
-}
-
-/**
- * Handles GET /api/history?contactId=X&limit=50
- */
-async function handleGetHistory(request: Request, env: Env): Promise<Response> {
-	try {
-		const url = new URL(request.url);
-		const contactId = parseInt(url.searchParams.get("contactId") || "0");
-		const limit = parseInt(url.searchParams.get("limit") || "50");
-
-		const results = await env.DB.prepare(`
-			SELECT user_message, ai_reply, timestamp 
-			FROM conversations 
-			WHERE contact_id = ? 
-			ORDER BY timestamp ASC 
-			LIMIT ?
-		`).bind(contactId, limit).all<ConversationRecord[]>();
-
-		return new Response(JSON.stringify(results.results), {
-			headers: { "content-type": "application/json" },
-		});
-	} catch (error) {
-		console.error("Error fetching history:", error);
-		return new Response(
-			JSON.stringify({ error: "Failed to fetch history" }),
-			{ status: 500, headers: { "content-type": "application/json" } }
-		);
-	}
-}
-
-/**
- * Handles POST /api/contacts - Create a new contact
- */
-async function handleCreateContact(request: Request, env: Env): Promise<Response> {
-	try {
-		const body = await request.json();
-		const { name, initials, persona, avatarColor } = body;
-
-		if (!name || !initials || !persona) {
-			return new Response(
-				JSON.stringify({ error: "缺少必要字段：name, initials, persona" }),
-				{ status: 400, headers: { "content-type": "application/json" } }
-			);
-		}
-
-		const result = await env.DB.prepare(`
-			INSERT INTO contacts (name, initials, persona, avatar_color, status)
-			VALUES (?, ?, ?, ?, 'online')
-		`).bind(name, initials, persona, avatarColor || '#6c8cbf').run();
-
-		return new Response(JSON.stringify({
-			success: true,
-			id: result.meta.last_row_id,
-			name,
-			initials,
-			persona,
-			avatarColor: avatarColor || '#6c8cbf'
-		}), {
-			headers: { "content-type": "application/json" }
-		});
-	} catch (error) {
-		console.error("Error creating contact:", error);
-		return new Response(
-			JSON.stringify({ error: "Failed to create contact" }),
-			{ status: 500, headers: { "content-type": "application/json" } }
-		);
-	}
-}
-
-/**
- * Handles POST /api/login - User login with password hashing
- */
-async function handleLogin(request: Request, env: Env): Promise<Response> {
-	try {
-		const { username, password } = await request.json();
-
-		if (!username || !password) {
-			return new Response(
-				JSON.stringify({ error: "用户名和密码不能为空" }),
-				{ status: 400, headers: { "content-type": "application/json" } }
-			);
-		}
-
-		// Hash the password using Web Crypto API
-		const encoder = new TextEncoder();
-		const data = encoder.encode(password);
-		const hashBuffer = await crypto.subtle.digest('SHA-256', data);
-		const hashArray = Array.from(new Uint8Array(hashBuffer));
-		const hashedPassword = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
-
-		// Check if user exists in database
-		const userResult = await env.DB.prepare(`
-			SELECT id, username, password_hash FROM users WHERE username = ?
-		`).bind(username).first();
-
-		if (!userResult) {
-			return new Response(
-				JSON.stringify({ error: "用户不存在" }),
-				{ status: 401, headers: { "content-type": "application/json" } }
-			);
-		}
-
-		if (userResult.password_hash !== hashedPassword) {
-			return new Response(
-				JSON.stringify({ error: "密码错误" }),
-				{ status: 401, headers: { "content-type": "application/json" } }
-			);
-		}
-
-		// Generate session token
-		const sessionId = crypto.randomUUID();
-		const expiresAt = Date.now() + 7 * 24 * 60 * 60 * 1000; // 7 days
-		sessions.set(sessionId, { userId: userResult.id, expiresAt });
-
-		return new Response(JSON.stringify({
-			success: true,
-			sessionId,
-			username: userResult.username,
-			userId: userResult.id
-		}), {
-			headers: { 
-				"content-type": "application/json",
-				"Set-Cookie": `sessionId=${sessionId}; Path=/; Max-Age=${7*24*60*60}; HttpOnly`
-			}
-		});
-	} catch (error) {
-		console.error("Login error:", error);
-		return new Response(
-			JSON.stringify({ error: "登录失败" }),
-			{ status: 500, headers: { "content-type": "application/json" } }
-		);
-	}
-}
-
-/**
- * Handles GET /api/auth/check - Check authentication status
- */
-function handleAuthCheck(request: Request): Response {
-	const cookieHeader = request.headers.get("Cookie");
-	let sessionId = null;
-
-	if (cookieHeader) {
-		const cookies = cookieHeader.split("; ");
-		for (const cookie of cookies) {
-			const [name, value] = cookie.split("=");
-			if (name === "sessionId") {
-				sessionId = value;
-				break;
-			}
-		}
-	}
-
-	// Also check URL parameter for non-browser clients
-	const url = new URL(request.url);
-	const paramSessionId = url.searchParams.get("sessionId");
-	if (paramSessionId) {
-		sessionId = paramSessionId;
-	}
-
-	if (!sessionId || !sessions.has(sessionId)) {
-		return new Response(JSON.stringify({ authenticated: false }), {
-			headers: { "content-type": "application/json" }
-		});
-	}
-
-	const session = sessions.get(sessionId)!;
-
-	// Check if session expired
-	if (Date.now() > session.expiresAt) {
-		sessions.delete(sessionId);
-		return new Response(JSON.stringify({ authenticated: false }), {
-			headers: { "content-type": "application/json" }
-		});
-	}
-
-	// Return user info
-	return new Response(JSON.stringify({
-		authenticated: true,
-		userId: session.userId
-	}), {
-		headers: { "content-type": "application/json" }
-	});
 }
