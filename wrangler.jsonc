@@ -18,5 +18,12 @@
 	"ai": {
 		"binding": "AI"
 	},
+	"d1_databases": [
+		{
+			"binding": "DB",
+			"database_name": "chat-db",
+			"database_id": "4d205c1e-b186-47e7-9fc9-241499ac1ef9"
+		}
+	],
 	"upload_source_maps": true
 }
