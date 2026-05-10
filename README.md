@@ -1,153 +1,97 @@
-# LLM Chat Application Template
+# AI 智能聊天应用 🤖
 
-A simple, ready-to-deploy chat application template powered by Cloudflare Workers AI. This template provides a clean starting point for building AI chat applications with streaming responses.
+基于 Cloudflare Workers AI + D1 数据库的多联系人聊天系统。
 
-[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/cloudflare/templates/tree/main/llm-chat-app-template)
+## ✨ 功能特性
 
-<!-- dash-content-start -->
+- **多 AI 助手**：默认内置服务介绍、林晓彤、陈子轩、周思敏等多个助手
+- **人设定制**：每个 AI 助手拥有独立的人设提示词，生成个性化回复
+- **登录认证**：SHA-256 密码哈希存储，会话管理
+- **创建新助手**：支持用户自定义添加 AI 助手
+- **聊天历史**：所有对话记录持久化到 D1 数据库
+- **流式响应**：SSE 协议实现打字机效果
 
-## Demo
+## 📦 技术栈
 
-This template demonstrates how to build an AI-powered chat interface using Cloudflare Workers AI with streaming responses. It features:
+- **后端**: Cloudflare Workers (TypeScript)
+- **AI**: Cloudflare Workers AI (`@cf/meta/llama-3.1-8b-instruct-fp8`)
+- **数据库**: Cloudflare D1
+- **前端**: Vanilla JavaScript + CSS
 
-- Real-time streaming of AI responses using Server-Sent Events (SSE)
-- Easy customization of models and system prompts
-- Support for AI Gateway integration
-- Clean, responsive UI that works on mobile and desktop
+## 🚀 快速开始
 
-## Features
+### 1. 安装 Wrangler CLI
 
-- 💬 Simple and responsive chat interface
-- ⚡ Server-Sent Events (SSE) for streaming responses
-- 🧠 Powered by Cloudflare Workers AI LLMs
-- 🛠️ Built with TypeScript and Cloudflare Workers
-- 📱 Mobile-friendly design
-- 🔄 Maintains chat history on the client
-- 🔎 Built-in Observability logging
-<!-- dash-content-end -->
+```bash
+npm install -g wrangler
+```
 
-## Getting Started
+### 2. 登录 Cloudflare
 
-### Prerequisites
+```bash
+wrangler login
+```
 
-- [Node.js](https://nodejs.org/) (v18 or newer)
-- [Wrangler CLI](https://developers.cloudflare.com/workers/wrangler/install-and-update/)
-- A Cloudflare account with Workers AI access
+### 3. 创建 D1 数据库
 
-### Installation
+```bash
+wrangler d1 create chat-db
+```
 
-1. Clone this repository:
+获取数据库 ID，更新 `wrangler.jsonc` 中的 `database_id` 字段。
 
-   ```bash
-   git clone https://github.com/cloudflare/templates.git
-   cd templates/llm-chat-app
-   ```
+### 4. 执行数据库初始化
 
-2. Install dependencies:
+```bash
+wrangler d1 execute chat-db --file=schema.sql
+```
 
-   ```bash
-   npm install
-   ```
-
-3. Generate Worker type definitions:
-   ```bash
-   npm run cf-typegen
-   ```
-
-### Development
-
-Start a local development server:
+### 5. 开发模式运行
 
 ```bash
 npm run dev
 ```
 
-This will start a local server at http://localhost:8787.
-
-Note: Using Workers AI accesses your Cloudflare account even during local development, which will incur usage charges.
-
-### Deployment
-
-Deploy to Cloudflare Workers:
+### 6. 部署到生产环境
 
 ```bash
 npm run deploy
 ```
 
-### Monitor
+## 🔐 默认账户
 
-View real-time logs associated with any deployed Worker:
+- **用户名**: `admin`
+- **密码**: `admin123`
+- ⚠️ **重要**: 首次登录后请修改默认密码！
 
+## 💬 API 接口
+
+| 接口 | 方法 | 描述 |
+|------|------|------|
+| `/api/contacts` | GET | 获取所有联系人列表 |
+| `/api/contacts` | POST | 创建新联系人（需登录） |
+| `/api/chat` | POST | 发送消息获取 AI 回复 |
+| `/api/history` | GET | 获取指定联系人的聊天历史 |
+| `/api/login` | POST | 用户登录 |
+| `/api/auth/check` | GET | 检查认证状态 |
+
+## 🎨 默认助手人设
+
+1. **🤖 服务介绍** (ID: 0) - 专门用于介绍系统功能和引导用户使用
+2. **林晓彤** (ID: 1) - 活泼开朗的女孩，爱用表情符号，亲切可爱
+3. **陈子轩** (ID: 2) - 专业 IT 工程师，逻辑清晰，简洁专业  
+4. **周思敏** (ID: 3) - 设计师，有艺术气息，分享设计灵感
+
+## 🛠️ 故障排查
+
+### 数据库表不存在
 ```bash
-npm wrangler tail
+wrangler d1 execute chat-db --file=schema.sql
 ```
 
-## Project Structure
+### AI 模型调用失败
+检查 Workers AI 是否已启用：`wrangler ai list`
 
-```
-/
-├── public/             # Static assets
-│   ├── index.html      # Chat UI HTML
-│   └── chat.js         # Chat UI frontend script
-├── src/
-│   ├── index.ts        # Main Worker entry point
-│   └── types.ts        # TypeScript type definitions
-├── test/               # Test files
-├── wrangler.jsonc      # Cloudflare Worker configuration
-├── tsconfig.json       # TypeScript configuration
-└── README.md           # This documentation
-```
+## 📄 License
 
-## How It Works
-
-### Backend
-
-The backend is built with Cloudflare Workers and uses the Workers AI platform to generate responses. The main components are:
-
-1. **API Endpoint** (`/api/chat`): Accepts POST requests with chat messages and streams responses
-2. **Streaming**: Uses Server-Sent Events (SSE) for real-time streaming of AI responses
-3. **Workers AI Binding**: Connects to Cloudflare's AI service via the Workers AI binding
-
-### Frontend
-
-The frontend is a simple HTML/CSS/JavaScript application that:
-
-1. Presents a chat interface
-2. Sends user messages to the API
-3. Processes streaming responses in real-time
-4. Maintains chat history on the client side
-
-## Customization
-
-### Changing the Model
-
-To use a different AI model, update the `MODEL_ID` constant in `src/index.ts`. You can find available models in the [Cloudflare Workers AI documentation](https://developers.cloudflare.com/workers-ai/models/).
-
-### Using AI Gateway
-
-The template includes commented code for AI Gateway integration, which provides additional capabilities like rate limiting, caching, and analytics.
-
-To enable AI Gateway:
-
-1. [Create an AI Gateway](https://dash.cloudflare.com/?to=/:account/ai/ai-gateway) in your Cloudflare dashboard
-2. Uncomment the gateway configuration in `src/index.ts`
-3. Replace `YOUR_GATEWAY_ID` with your actual AI Gateway ID
-4. Configure other gateway options as needed:
-   - `skipCache`: Set to `true` to bypass gateway caching
-   - `cacheTtl`: Set the cache time-to-live in seconds
-
-Learn more about [AI Gateway](https://developers.cloudflare.com/ai-gateway/).
-
-### Modifying the System Prompt
-
-The default system prompt can be changed by updating the `SYSTEM_PROMPT` constant in `src/index.ts`.
-
-### Styling
-
-The UI styling is contained in the `<style>` section of `public/index.html`. You can modify the CSS variables at the top to quickly change the color scheme.
-
-## Resources
-
-- [Cloudflare Workers Documentation](https://developers.cloudflare.com/workers/)
-- [Cloudflare Workers AI Documentation](https://developers.cloudflare.com/workers-ai/)
-- [Workers AI Models](https://developers.cloudflare.com/workers-ai/models/)
+MIT
