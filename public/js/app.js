@@ -148,9 +148,10 @@
 			}
 
 			const response = await fetch(url);
-			const contacts = await response.json();
+			const result = await response.json();
+			const contacts = result.success ? result.data : [];
 
-			if (contacts.length === 0) {
+			if (!Array.isArray(contacts) || contacts.length === 0) {
 				elements.contactList.innerHTML = '<div style="padding:20px;text-align:center;color:#9aaebf">暂无联系人</div>';
 				return;
 			}
@@ -205,7 +206,8 @@
 		try {
 			const sessionIdParam = state.currentSessionId ? `&sessionId=${state.currentSessionId}` : '';
 			const response = await fetch(`/api/history?contactId=${contactId}&limit=50${sessionIdParam}`);
-			const records = await response.json();
+			const result = await response.json();
+			const records = result.success ? result.data : [];
 
 			state.chatHistory = records.map(record => ({
 				user: record.user_message,
@@ -277,7 +279,7 @@
 			if (data.success) {
 				closeCreateModal();
 				await loadContacts();
-				selectContact(data.id);
+				selectContact(data.data.id);
 			} else {
 				alert(data.error || '创建失败');
 			}
