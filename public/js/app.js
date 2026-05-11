@@ -459,4 +459,11 @@
 		return String(str).replace(/"/g, '&quot;');
 	}
 
+	// 暴露到全局以便 onclick 调用
+	window.__app = window.__app || {};
+	window.__app.performLogin = performLogin;
+	window.__app.closeLoginModal = closeLoginModal;
+	window.__app.createNewContact = createNewContact;
+	window.__app.closeCreateModal = closeCreateModal;
+
 })();
