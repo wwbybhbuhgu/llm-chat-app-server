@@ -10,7 +10,9 @@
 	"compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
 	"assets": {
 		"binding": "ASSETS",
-		"directory": "./public"
+		"directory": "./public",
+		"deployment_target_max_assets": 10000,
+		"not_found_handling": "single-page-application"
 	},
 	"observability": {
 		"enabled": true
