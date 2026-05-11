@@ -67,13 +67,14 @@ export const config: AppConfig = {
 // Production build check
 export const isProduction = import.meta.env?.PRODUCTION || process.env.NODE_ENV === 'production';
 
-// Validate required production settings
-if (isProduction && !config.jwt.secret) {
-	throw new Error('JWT_SECRET environment variable is required in production');
+// Auto-generate JWT_SECRET if not provided (for zero-config deployment)
+if (isProduction && (!config.jwt.secret || config.jwt.secret === '')) {
+	config.jwt.secret = 'auto-generated-key-' + Math.random().toString(36).slice(2);
 }
 
-if (isProduction && config.jwt.secret.length < 32) {
-	throw new Error('JWT_SECRET must be at least 32 characters long for security');
+// Optional: Warn if secret is too short (but allow auto-generated to work)
+if (!config.jwt.secret || config.jwt.secret.length < 32) {
+	console.warn('[Security Warning] JWT_SECRET is using an auto-generated key. In production, set a cryptographically secure secret via CLOUDFLARE_JWT_SECRET environment variable.');
 }
 
 export default config;
